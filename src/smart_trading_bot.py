@@ -13,6 +13,17 @@ import os
 config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'config.env')
 load_dotenv(config_path)
 
+# Pattern reliability weights (stronger patterns = higher score)
+PATTERN_WEIGHTS = {
+    'BULLISH_ENGULFING': 4, 'BEARISH_ENGULFING': 4,
+    'MORNING_STAR': 4, 'EVENING_STAR': 4,
+    'THREE_WHITE_SOLDIERS': 3, 'THREE_BLACK_CROWS': 3,
+    'PIERCING_LINE': 3, 'DARK_CLOUD_COVER': 3,
+    'HAMMER': 2, 'INVERTED_HAMMER': 2, 'SHOOTING_STAR': 2, 'HANGING_MAN': 2,
+    'BULLISH_HARAMI': 2, 'BEARISH_HARAMI': 2,
+    'TWEEZERS_BOTTOM': 1, 'TWEEZERS_TOP': 1,
+}
+
 class SmartTradingBot:
     def __init__(self):
         # Parse multiple symbols
@@ -31,6 +42,19 @@ class SmartTradingBot:
         self.min_pattern_strength = int(os.getenv('MIN_PATTERN_STRENGTH', '4'))
         self.risk_reward_ratio = float(os.getenv('RISK_REWARD_RATIO', '2.5'))
         self.sl_breathing_room = int(os.getenv('SL_BREATHING_ROOM_PIPS', '3'))
+        
+        # Enhanced parameters
+        self.higher_tf = os.getenv('HIGHER_TIMEFRAME', 'H1')  # Multi-TF confirmation
+        self.atr_period = int(os.getenv('ATR_PERIOD', '14'))
+        self.trade_cooldown_mins = int(os.getenv('TRADE_COOLDOWN_MINS', '15'))
+        self.max_broken_levels = int(os.getenv('MAX_BROKEN_LEVELS', '5'))
+        self.enable_trailing_stop = os.getenv('ENABLE_TRAILING_STOP', 'true').lower() == 'true'
+        self.trailing_activation_pips = int(os.getenv('TRAILING_ACTIVATION_PIPS', '15'))
+        self.trailing_distance_pips = int(os.getenv('TRAILING_DISTANCE_PIPS', '10'))
+        self.enable_session_filter = os.getenv('ENABLE_SESSION_FILTER', 'true').lower() == 'true'
+        
+        # Trade cooldown tracking: {symbol: last_trade_timestamp}
+        self.last_trade_time: Dict[str, float] = {}
         
         # Setup logging
         self.setup_logging()
@@ -85,6 +109,65 @@ class SmartTradingBot:
         self.logger.info(f"Connected to MT5: {server}")
         return True
         
+    def get_pip_value(self, symbol: str) -> float:
+        """Get pip value for symbol (JPY pairs use 0.01, others 0.0001)"""
+        symbol_upper = symbol.upper()
+        if 'JPY' in symbol_upper:
+            return 0.01
+        return 0.0001
+    
+    def pips_to_price(self, symbol: str, pips: int) -> float:
+        """Convert pips to price distance"""
+        return pips * self.get_pip_value(symbol)
+    
+    def calculate_atr(self, df: pd.DataFrame, period: int = None) -> pd.Series:
+        """Calculate Average True Range for volatility-based sizing"""
+        period = period or self.atr_period
+        high_low = df['high'] - df['low']
+        high_close = np.abs(df['high'] - df['close'].shift())
+        low_close = np.abs(df['low'] - df['close'].shift())
+        true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        return true_range.rolling(window=period).mean()
+    
+    def is_session_active(self) -> bool:
+        """Check if we're in a liquid trading session (London/NY overlap preferred)"""
+        if not self.enable_session_filter:
+            return True
+        hour = datetime.now().hour
+        # London: 8-16, NY: 13-21 UTC. Overlap 13-16 is best. Avoid 0-6 (Asian only)
+        return 7 <= hour <= 22  # 6 hours of overlap + buffer
+    
+    def is_on_cooldown(self, symbol: str) -> bool:
+        """Check if symbol is on trade cooldown"""
+        if symbol not in self.last_trade_time:
+            return False
+        elapsed = (time.time() - self.last_trade_time[symbol]) / 60
+        return elapsed < self.trade_cooldown_mins
+    
+    def prune_broken_levels(self, symbol: str, current_price: float):
+        """Keep only recent broken levels within max_broken_levels"""
+        symbol_info = self.symbol_data[symbol]
+        pip = self.get_pip_value(symbol)
+        
+        # Remove broken supports far below price (no longer relevant)
+        symbol_info['broken_support_levels'] = [
+            lvl for lvl in symbol_info['broken_support_levels']
+            if current_price - lvl < 50 * pip  # Within 50 pips
+        ][-self.max_broken_levels:]
+        
+        # Remove broken resistances far above price
+        symbol_info['broken_resistance_levels'] = [
+            lvl for lvl in symbol_info['broken_resistance_levels']
+            if lvl - current_price < 50 * pip
+        ][-self.max_broken_levels:]
+    
+    def get_higher_tf_trend(self, symbol: str) -> str:
+        """Get trend from higher timeframe for confirmation"""
+        df = self.get_ohlc_data(symbol, self.higher_tf, 50)
+        if len(df) < 20:
+            return "NEUTRAL"
+        return self.detect_trend_direction(df)
+    
     def get_ohlc_data(self, symbol: str, timeframe: str, periods: int) -> pd.DataFrame:
         """Get OHLC data from MT5"""
         tf_map = {
@@ -93,10 +176,12 @@ class SmartTradingBot:
             'M15': mt5.TIMEFRAME_M15,
             'H1': mt5.TIMEFRAME_H1,
             'H4': mt5.TIMEFRAME_H4,
-            'D1': mt5.TIMEFRAME_D1
+            'D1': mt5.TIMEFRAME_D1,
+            'W1': mt5.TIMEFRAME_W1,
+            'MN1': mt5.TIMEFRAME_MN1,
         }
-        
-        rates = mt5.copy_rates_from_pos(symbol, tf_map[timeframe], 0, periods)
+        mt5_tf = tf_map.get(timeframe, mt5.TIMEFRAME_H1)
+        rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, periods)
         if rates is None:
             return pd.DataFrame()
             
@@ -147,16 +232,23 @@ class SmartTradingBot:
                 support_levels.append(lows[i])
         
         # Add price action support/resistance detection
-        support_levels.extend(self.detect_price_action_support(df))
-        resistance_levels.extend(self.detect_price_action_resistance(df))
+        pip = self.get_pip_value(symbol)
+        support_levels.extend(self.detect_price_action_support(df, pip))
+        resistance_levels.extend(self.detect_price_action_resistance(df, pip))
+        
+        # ATR-based tolerance for clustering (adapts to volatility)
+        atr = self.calculate_atr(df)
+        atr_tolerance = atr.iloc[-1] * 0.3 if len(atr) > 0 else 0.0003
+        atr_tolerance = max(atr_tolerance, self.get_pip_value(symbol) * 2)  # Min 2 pips
         
         # Cluster nearby levels
-        support_levels = self.cluster_levels(support_levels, tolerance=0.0003)
-        resistance_levels = self.cluster_levels(resistance_levels, tolerance=0.0003)
+        support_levels = self.cluster_levels(support_levels, tolerance=atr_tolerance)
+        resistance_levels = self.cluster_levels(resistance_levels, tolerance=atr_tolerance)
         
         # Filter by touch count (reduced threshold)
-        support_levels = self.filter_by_touches(df, support_levels, 'support')
-        resistance_levels = self.filter_by_touches(df, resistance_levels, 'resistance')
+        touch_tolerance = self.get_pip_value(symbol) * 2
+        support_levels = self.filter_by_touches(df, support_levels, 'support', touch_tolerance)
+        resistance_levels = self.filter_by_touches(df, resistance_levels, 'resistance', touch_tolerance)
         
         # Check for role reversals
         self.check_role_reversals(symbol, df, support_levels, resistance_levels)
@@ -167,17 +259,18 @@ class SmartTradingBot:
         """Check for support/resistance role reversals"""
         current_price = df.iloc[-1]['close']
         symbol_info = self.symbol_data[symbol]
+        break_threshold = self.get_pip_value(symbol) * 5  # 5 pips beyond level
         
         # Check if support levels have been broken (now resistance)
         for support in support_levels[:]:
-            if current_price < support - 0.001:  # Broken support
+            if current_price < support - break_threshold:  # Broken support
                 if support not in symbol_info['broken_support_levels']:
                     symbol_info['broken_support_levels'].append(support)
                     self.logger.info(f"{symbol}: Support {support:.5f} broken - now resistance")
                     
         # Check if resistance levels have been broken (now support)
         for resistance in resistance_levels[:]:
-            if current_price > resistance + 0.001:  # Broken resistance
+            if current_price > resistance + break_threshold:  # Broken resistance
                 if resistance not in symbol_info['broken_resistance_levels']:
                     symbol_info['broken_resistance_levels'].append(resistance)
                     self.logger.info(f"{symbol}: Resistance {resistance:.5f} broken - now support")
@@ -205,13 +298,14 @@ class SmartTradingBot:
             
         return clustered
         
-    def filter_by_touches(self, df: pd.DataFrame, levels: List[float], level_type: str) -> List[float]:
+    def filter_by_touches(self, df: pd.DataFrame, levels: List[float], level_type: str, tolerance: float = None) -> List[float]:
         """Filter levels by number of touches (reduced threshold)"""
         filtered_levels = []
+        if tolerance is None:
+            tolerance = 0.0002  # Default 2 pips
         
         for level in levels:
             touches = 0
-            tolerance = 0.0002  # 2 pips tolerance
             
             for i in range(len(df)):
                 if level_type == 'support':
@@ -229,15 +323,16 @@ class SmartTradingBot:
     def is_near_support(self, symbol: str, current_price: float) -> bool:
         """Check if price is near support level (including broken resistance)"""
         symbol_info = self.symbol_data[symbol]
+        zone_buffer = self.pips_to_price(symbol, self.sr_zone_buffer)
         
-        # Check current support levels
+        # Check current support levels - price within zone
         for support in symbol_info['support_levels']:
-            if abs(current_price - support) <= (self.sr_zone_buffer * 0.0001):
+            if abs(current_price - support) <= zone_buffer:
                 return True
                 
         # Check broken resistance levels (now support)
         for broken_resistance in symbol_info['broken_resistance_levels']:
-            if abs(current_price - broken_resistance) <= (self.sr_zone_buffer * 0.0001):
+            if abs(current_price - broken_resistance) <= zone_buffer:
                 return True
                 
         return False
@@ -245,25 +340,26 @@ class SmartTradingBot:
     def is_near_resistance(self, symbol: str, current_price: float) -> bool:
         """Check if price is near resistance level (including broken support)"""
         symbol_info = self.symbol_data[symbol]
+        zone_buffer = self.pips_to_price(symbol, self.sr_zone_buffer)
         
-        # Check current resistance levels
+        # Check current resistance levels - price within zone
         for resistance in symbol_info['resistance_levels']:
-            if abs(current_price - resistance) <= (self.sr_zone_buffer * 0.0001):
+            if abs(current_price - resistance) <= zone_buffer:
                 return True
                 
         # Check broken support levels (now resistance)
         for broken_support in symbol_info['broken_support_levels']:
-            if abs(current_price - broken_support) <= (self.sr_zone_buffer * 0.0001):
+            if abs(current_price - broken_support) <= zone_buffer:
                 return True
                 
         return False
         
     def get_spread(self, symbol: str) -> float:
-        """Get current spread for a specific symbol"""
+        """Get current spread for a specific symbol (in price terms)"""
         symbol_info = mt5.symbol_info(symbol)
-        if symbol_info:
-            return symbol_info.spread * 0.0001  # Convert to price
-        return 0.0002  # Default 2 pips
+        if symbol_info and hasattr(symbol_info, 'spread') and hasattr(symbol_info, 'point'):
+            return symbol_info.spread * symbol_info.point
+        return self.get_pip_value(symbol) * 2  # Default 2 pips
         
     def calculate_dynamic_sl_tp(self, symbol: str, entry_price: float, entry_candle: pd.Series, is_buy: bool) -> Tuple[float, float]:
         """Calculate dynamic SL and TP based on S/R zones and recent volatility"""
@@ -299,17 +395,18 @@ class SmartTradingBot:
             if broken_resistance < entry_price and (nearest_support is None or broken_resistance > nearest_support):
                 nearest_support = broken_resistance
         
+        pip = self.get_pip_value(symbol)
         if nearest_support:
             # SL just below the support level
-            sl_distance = entry_price - nearest_support + spread + 0.0001  # 1 pip buffer
+            sl_distance = entry_price - nearest_support + spread + pip
         else:
             # Fallback to candle-based SL (but tighter)
             candle_low = entry_candle['low']
-            sl_distance = max(entry_price - candle_low + spread + 0.0001, 0.0008)  # 8 pips minimum
+            sl_distance = max(entry_price - candle_low + spread + pip, self.pips_to_price(symbol, 8))
             
         # Ensure reasonable SL distance (not too tight, not too wide)
-        sl_distance = max(sl_distance, 0.0008)   # 8 pips minimum
-        sl_distance = min(sl_distance, 0.0020)   # 20 pips maximum
+        sl_distance = max(sl_distance, self.pips_to_price(symbol, 8))
+        sl_distance = min(sl_distance, self.pips_to_price(symbol, self.stop_loss_pips))
         
         return sl_distance
         
@@ -328,23 +425,25 @@ class SmartTradingBot:
             if broken_support > entry_price and (nearest_resistance is None or broken_support < nearest_resistance):
                 nearest_resistance = broken_support
         
+        pip = self.get_pip_value(symbol)
         if nearest_resistance:
             # SL just above the resistance level
-            sl_distance = nearest_resistance - entry_price + spread + 0.0001  # 1 pip buffer
+            sl_distance = nearest_resistance - entry_price + spread + pip
         else:
             # Fallback to candle-based SL (but tighter)
             candle_high = entry_candle['high']
-            sl_distance = max(candle_high - entry_price + spread + 0.0001, 0.0008)  # 8 pips minimum
+            sl_distance = max(candle_high - entry_price + spread + pip, self.pips_to_price(symbol, 8))
             
         # Ensure reasonable SL distance (not too tight, not too wide)
-        sl_distance = max(sl_distance, 0.0008)   # 8 pips minimum
-        sl_distance = min(sl_distance, 0.0020)   # 20 pips maximum
+        sl_distance = max(sl_distance, self.pips_to_price(symbol, 8))
+        sl_distance = min(sl_distance, self.pips_to_price(symbol, self.stop_loss_pips))
         
         return sl_distance
         
-    def detect_price_action_support(self, df: pd.DataFrame) -> List[float]:
+    def detect_price_action_support(self, df: pd.DataFrame, pip: float = 0.0001) -> List[float]:
         """Detect support levels from price action (like your red line)"""
         support_levels = []
+        tolerance = pip * 2  # 2 pips tolerance
         
         if len(df) < 10:
             return support_levels
@@ -355,7 +454,6 @@ class SmartTradingBot:
             
             # Check if this level has been tested multiple times
             touches = 0
-            tolerance = 0.0002  # 2 pips tolerance
             
             for j in range(max(0, i-20), min(len(df), i+20)):
                 if abs(df.iloc[j]['low'] - current_low) <= tolerance:
@@ -367,9 +465,10 @@ class SmartTradingBot:
                 
         return support_levels
         
-    def detect_price_action_resistance(self, df: pd.DataFrame) -> List[float]:
+    def detect_price_action_resistance(self, df: pd.DataFrame, pip: float = 0.0001) -> List[float]:
         """Detect resistance levels from price action"""
         resistance_levels = []
+        tolerance = pip * 2  # 2 pips tolerance
         
         if len(df) < 10:
             return resistance_levels
@@ -380,7 +479,6 @@ class SmartTradingBot:
             
             # Check if this level has been tested multiple times
             touches = 0
-            tolerance = 0.0002  # 2 pips tolerance
             
             for j in range(max(0, i-20), min(len(df), i+20)):
                 if abs(df.iloc[j]['high'] - current_high) <= tolerance:
@@ -397,7 +495,16 @@ class SmartTradingBot:
         confluence_score = 0
         symbol_info = self.symbol_data[symbol]
         
-        # Trend alignment bonus
+        # Higher timeframe trend alignment (multi-TF confirmation)
+        higher_tf_trend = self.get_higher_tf_trend(symbol)
+        if higher_tf_trend == "BULLISH":
+            confluence_score += 2
+        elif higher_tf_trend == "NEUTRAL":
+            confluence_score += 1
+        elif higher_tf_trend == "BEARISH":
+            confluence_score -= 1  # Counter-trend trades are riskier
+        
+        # M1 trend alignment bonus
         if symbol_info['trend_direction'] == "BULLISH":
             confluence_score += 2
         elif symbol_info['trend_direction'] == "NEUTRAL":
@@ -433,7 +540,16 @@ class SmartTradingBot:
         confluence_score = 0
         symbol_info = self.symbol_data[symbol]
         
-        # Trend alignment bonus
+        # Higher timeframe trend alignment (multi-TF confirmation)
+        higher_tf_trend = self.get_higher_tf_trend(symbol)
+        if higher_tf_trend == "BEARISH":
+            confluence_score += 2
+        elif higher_tf_trend == "NEUTRAL":
+            confluence_score += 1
+        elif higher_tf_trend == "BULLISH":
+            confluence_score -= 1  # Counter-trend trades are riskier
+        
+        # M1 trend alignment bonus
         if symbol_info['trend_direction'] == "BEARISH":
             confluence_score += 2
         elif symbol_info['trend_direction'] == "NEUTRAL":
@@ -731,21 +847,24 @@ class SmartTradingBot:
         return patterns
         
     def calculate_pattern_strength(self, symbol: str, patterns: List[str], df: pd.DataFrame) -> int:
-        """Calculate pattern strength based on multiple factors"""
-        strength = len(patterns) * 2  # Base strength from number of patterns
+        """Calculate pattern strength using weighted pattern scores + confluence"""
+        # Use pattern weights (stronger patterns = higher score)
+        strength = sum(PATTERN_WEIGHTS.get(p, 1) for p in patterns)
         
         # Volume confirmation
         if len(df) > 0:
             current_volume = df.iloc[-1]['tick_volume']
             avg_volume = df['tick_volume'].mean()
-            if current_volume > avg_volume * 1.2:  # Reduced threshold
+            if current_volume > avg_volume * 1.5:
+                strength += 2
+            elif current_volume > avg_volume * 1.2:
                 strength += 1
                 
         # Trend alignment
         trend_direction = self.symbol_data[symbol]['trend_direction']
-        if trend_direction == "BULLISH" and patterns and 'BULLISH' in patterns[0]:
-            strength += 1
-        elif trend_direction == "BEARISH" and patterns and 'BEARISH' in patterns[0]:
+        if trend_direction in ("BULLISH", "BEARISH"):
+            strength += 2
+        elif trend_direction == "NEUTRAL":
             strength += 1
                 
         return strength
@@ -863,13 +982,64 @@ class SmartTradingBot:
         else:
             positions = mt5.positions_get()
         return len(positions) if positions else 0
+    
+    def update_trailing_stops(self):
+        """Update trailing stops for open positions in profit"""
+        if not self.enable_trailing_stop:
+            return
+        positions = mt5.positions_get()
+        if not positions:
+            return
+        for pos in positions:
+            if pos.magic != 234000:
+                continue
+            symbol = pos.symbol
+            pip = self.get_pip_value(symbol)
+            trail_dist = self.pips_to_price(symbol, self.trailing_distance_pips)
+            if pos.type == mt5.ORDER_TYPE_BUY:
+                profit_pips = (mt5.symbol_info_tick(symbol).ask - pos.price_open) / pip
+                if profit_pips >= self.trailing_activation_pips:
+                    new_sl = mt5.symbol_info_tick(symbol).ask - trail_dist
+                    if new_sl > pos.sl and new_sl < mt5.symbol_info_tick(symbol).ask:
+                        self._modify_position_sl(pos, new_sl)
+            else:  # SELL
+                profit_pips = (pos.price_open - mt5.symbol_info_tick(symbol).bid) / pip
+                if profit_pips >= self.trailing_activation_pips:
+                    new_sl = mt5.symbol_info_tick(symbol).bid + trail_dist
+                    if (pos.sl == 0 or new_sl < pos.sl) and new_sl > mt5.symbol_info_tick(symbol).bid:
+                        self._modify_position_sl(pos, new_sl)
+    
+    def _modify_position_sl(self, position, new_sl: float):
+        """Modify position stop loss"""
+        symbol_info = mt5.symbol_info(position.symbol)
+        digits = symbol_info.digits if symbol_info else 5
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": position.symbol,
+            "position": position.ticket,
+            "sl": round(new_sl, digits),
+            "tp": position.tp,
+        }
+        result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            self.logger.info(f"Trailing stop updated: {position.symbol} SL={new_sl:.5f}")
         
     def run(self):
         """Main trading loop for multiple symbols"""
         self.logger.info(f"Starting Enhanced Smart Trading Bot for symbols: {', '.join(self.symbols)}")
+        self.logger.info(f"Features: Multi-TF({self.higher_tf}), ATR zones, Pattern weights, Trailing stop: {self.enable_trailing_stop}")
         
         while True:
             try:
+                # Update trailing stops first
+                self.update_trailing_stops()
+                
+                # Session filter - skip analysis during low liquidity
+                if not self.is_session_active():
+                    self.logger.debug("Outside trading session - waiting")
+                    time.sleep(60)
+                    continue
+                
                 total_open_positions = self.get_open_positions_count()
                 
                 for symbol in self.symbols:
@@ -878,6 +1048,10 @@ class SmartTradingBot:
                         if total_open_positions >= self.max_open_trades:
                             self.logger.info(f"Maximum open trades reached: {total_open_positions}")
                             break
+                        
+                        # Trade cooldown - avoid overtrading same symbol
+                        if self.is_on_cooldown(symbol):
+                            continue
                             
                         # Get current market data for this symbol
                         df = self.get_ohlc_data(symbol, self.timeframe, self.sr_lookback)
@@ -897,11 +1071,15 @@ class SmartTradingBot:
                         current_price = df.iloc[-1]['close']
                         entry_candle = df.iloc[-1]
                         
+                        # Prune old broken levels to keep analysis relevant
+                        self.prune_broken_levels(symbol, current_price)
+                        
                         # Check for buy signal
                         should_buy, buy_patterns, buy_strength = self.should_buy(symbol, df, current_price)
                         if should_buy:
                             if self.place_buy_order(symbol, current_price, buy_patterns, buy_strength, entry_candle):
                                 total_open_positions += 1
+                                self.last_trade_time[symbol] = time.time()
                                 self.logger.info(f"BUY signal for {symbol}: {buy_patterns}, Strength: {buy_strength}")
                                 
                         # Check for sell signal
@@ -909,6 +1087,7 @@ class SmartTradingBot:
                         if should_sell:
                             if self.place_sell_order(symbol, current_price, sell_patterns, sell_strength, entry_candle):
                                 total_open_positions += 1
+                                self.last_trade_time[symbol] = time.time()
                                 self.logger.info(f"SELL signal for {symbol}: {sell_patterns}, Strength: {sell_strength}")
                                 
                         # Log current status for this symbol

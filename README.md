@@ -32,11 +32,20 @@ A sophisticated trading bot that combines **smart support/resistance detection**
 - ✅ Tweezers Top
 
 ### Trading Strategy
-1. **Detects Support/Resistance zones**
-2. **Waits for price to approach these zones**
-3. **Scans for strong candlestick patterns**
-4. **Calculates pattern strength**
-5. **Places trades with proper risk management**
+1. **Detects Support/Resistance zones** (ATR-adaptive, symbol-specific pips)
+2. **Multi-timeframe confirmation** (H1 trend filter)
+3. **Waits for price to approach these zones**
+4. **Scans for strong candlestick patterns** (weighted by reliability)
+5. **Calculates pattern strength** with confluence scoring
+6. **Places trades with proper risk management** + optional trailing stop
+
+### Enhanced Features
+- **Multi-timeframe analysis**: H1 trend confirmation before M1 entries
+- **ATR-based zones**: Support/resistance tolerance adapts to volatility
+- **Pattern weighting**: Engulfing/Morning Star (4) > Hammer (2) > Tweezers (1)
+- **Trailing stop**: Locks in profits when trade moves 15+ pips in favor
+- **Session filter**: Trades during London/NY overlap (7–22 UTC)
+- **Trade cooldown**: 15-min cooldown per symbol to avoid overtrading
 
 ## 📋 Requirements
 
@@ -88,6 +97,15 @@ SR_ZONE_BUFFER_PIPS=3
 # Pattern Parameters
 PATTERN_CONFIRMATION_CANDLES=2
 MIN_PATTERN_STRENGTH=3
+
+# Enhanced Features (optional)
+HIGHER_TIMEFRAME=H1
+ATR_PERIOD=14
+TRADE_COOLDOWN_MINS=15
+ENABLE_TRAILING_STOP=true
+TRAILING_ACTIVATION_PIPS=15
+TRAILING_DISTANCE_PIPS=10
+ENABLE_SESSION_FILTER=true
 ```
 
 ## 🚀 Usage
