@@ -60,16 +60,17 @@ A sophisticated trading bot that combines **smart support/resistance detection**
 
 ## ⚙️ Configuration
 
-Edit `config/config.env` with your settings:
+1. Copy the example config: `copy config\config.env.example config\config.env`
+2. Edit `config/config.env` with your MT5 credentials and trading settings:
 
 ```env
-# MT5 Account
-MT5_LOGIN=2001258379
-MT5_PASSWORD=MA1@ANGaaa
-MT5_SERVER=JustMarkets-Demo
+# MT5 Account (replace with your credentials)
+MT5_LOGIN=your_login
+MT5_PASSWORD=your_password
+MT5_SERVER=YourBroker-Demo
 
 # Trading Parameters
-SYMBOL=EURUSD
+SYMBOLS=GBPJPY.s,EURUSD.s,USDJPY.s,GBPUSD.s
 TIMEFRAME=M1
 LOT_SIZE=0.01
 STOP_LOSS_PIPS=20
@@ -80,13 +81,13 @@ MAX_RISK_PERCENT=2
 MAX_OPEN_TRADES=3
 
 # Support/Resistance Parameters
-SR_LOOKBACK_PERIODS=100
-SR_TOUCH_THRESHOLD=3
-SR_ZONE_BUFFER_PIPS=5
+SR_LOOKBACK_PERIODS=200
+SR_TOUCH_THRESHOLD=2
+SR_ZONE_BUFFER_PIPS=3
 
 # Pattern Parameters
-PATTERN_CONFIRMATION_CANDLES=3
-MIN_PATTERN_STRENGTH=7
+PATTERN_CONFIRMATION_CANDLES=2
+MIN_PATTERN_STRENGTH=3
 ```
 
 ## 🚀 Usage
