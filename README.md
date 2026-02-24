@@ -32,11 +32,20 @@ A sophisticated trading bot that combines **smart support/resistance detection**
 - ✅ Tweezers Top
 
 ### Trading Strategy
-1. **Detects Support/Resistance zones**
-2. **Waits for price to approach these zones**
-3. **Scans for strong candlestick patterns**
-4. **Calculates pattern strength**
-5. **Places trades with proper risk management**
+1. **Detects Support/Resistance zones** (ATR-adaptive, symbol-specific pips)
+2. **Multi-timeframe confirmation** (H1 trend filter)
+3. **Waits for price to approach these zones**
+4. **Scans for strong candlestick patterns** (weighted by reliability)
+5. **Calculates pattern strength** with confluence scoring
+6. **Places trades with proper risk management** + optional trailing stop
+
+### Enhanced Features
+- **Multi-timeframe analysis**: H1 trend confirmation before M1 entries
+- **ATR-based zones**: Support/resistance tolerance adapts to volatility
+- **Pattern weighting**: Engulfing/Morning Star (4) > Hammer (2) > Tweezers (1)
+- **Trailing stop**: Locks in profits when trade moves 15+ pips in favor
+- **Session filter**: Trades during London/NY overlap (7–22 UTC)
+- **Trade cooldown**: 15-min cooldown per symbol to avoid overtrading
 
 ## 📋 Requirements
 
@@ -60,16 +69,17 @@ A sophisticated trading bot that combines **smart support/resistance detection**
 
 ## ⚙️ Configuration
 
-Edit `config/config.env` with your settings:
+1. Copy the example config: `copy config\config.env.example config\config.env`
+2. Edit `config/config.env` with your MT5 credentials and trading settings:
 
 ```env
-# MT5 Account
-MT5_LOGIN=2001258379
-MT5_PASSWORD=MA1@ANGaaa
-MT5_SERVER=JustMarkets-Demo
+# MT5 Account (replace with your credentials)
+MT5_LOGIN=your_login
+MT5_PASSWORD=your_password
+MT5_SERVER=YourBroker-Demo
 
 # Trading Parameters
-SYMBOL=EURUSD
+SYMBOLS=GBPJPY.s,EURUSD.s,USDJPY.s,GBPUSD.s
 TIMEFRAME=M1
 LOT_SIZE=0.01
 STOP_LOSS_PIPS=20
@@ -80,13 +90,22 @@ MAX_RISK_PERCENT=2
 MAX_OPEN_TRADES=3
 
 # Support/Resistance Parameters
-SR_LOOKBACK_PERIODS=100
-SR_TOUCH_THRESHOLD=3
-SR_ZONE_BUFFER_PIPS=5
+SR_LOOKBACK_PERIODS=200
+SR_TOUCH_THRESHOLD=2
+SR_ZONE_BUFFER_PIPS=3
 
 # Pattern Parameters
-PATTERN_CONFIRMATION_CANDLES=3
-MIN_PATTERN_STRENGTH=7
+PATTERN_CONFIRMATION_CANDLES=2
+MIN_PATTERN_STRENGTH=3
+
+# Enhanced Features (optional)
+HIGHER_TIMEFRAME=H1
+ATR_PERIOD=14
+TRADE_COOLDOWN_MINS=15
+ENABLE_TRAILING_STOP=true
+TRAILING_ACTIVATION_PIPS=15
+TRAILING_DISTANCE_PIPS=10
+ENABLE_SESSION_FILTER=true
 ```
 
 ## 🚀 Usage
